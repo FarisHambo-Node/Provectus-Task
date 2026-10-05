@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import shutil
+import tempfile
+from collections.abc import Iterator
+from pathlib import Path
+
 import pytest
 
 from agent.container import AgentContainer, build_container
@@ -24,3 +29,18 @@ def settings() -> Settings:
 @pytest.fixture
 def container(settings: Settings) -> AgentContainer:
     return build_container(settings)
+
+
+@pytest.fixture
+def sqlite_path() -> Iterator[Path]:
+    """A throwaway path for a SQLite checkpoint file.
+
+    Deliberately not `tmp_path`: that fixture garbage-collects pytest's shared
+    temp root, which fails hard if any leftover directory there is not
+    deletable. This owns its directory and cleans up only that.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="agent-checkpoints-"))
+    try:
+        yield directory / "checkpoints.sqlite"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)

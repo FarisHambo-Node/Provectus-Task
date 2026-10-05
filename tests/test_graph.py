@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from agent.container import build_container
-from agent.errors import RetrievalError, ToolThrottledError
+from agent.errors import RetrievalError, ThreadNotFoundError, ToolThrottledError
 from agent.graph import ConversationAgent
 from agent.rag.corpus import SAMPLE_CORPUS
 from agent.rag.retriever import to_chunk
@@ -236,3 +236,173 @@ async def test_metrics_record_tool_outcomes():
 async def test_health_report_covers_every_registered_tool():
     agent = make_agent()
     assert set(await agent.container.health_report()) == {"rag_search", "web_search"}
+
+
+# --- memory compaction -----------------------------------------------------
+
+
+def compacting_agent() -> ConversationAgent:
+    """Summarise aggressively so a test does not need a 9-turn conversation."""
+    return make_agent(history_window_turns=1, summarize_after_turns=2)
+
+
+@pytest.mark.asyncio
+async def test_summary_is_empty_until_the_threshold_is_crossed():
+    agent = compacting_agent()
+    first = await agent.ask("how do we chunk documents?", thread_id="t")
+    assert first["summary"] == ""
+
+
+@pytest.mark.asyncio
+async def test_long_thread_is_summarised_and_the_checkpoint_shrinks():
+    agent = compacting_agent()
+    for question in (
+        "how do we chunk documents?",
+        "how do we embed them?",
+        "how do we deploy the api?",
+    ):
+        result = await agent.ask(question, thread_id="t")
+
+    state = await agent.state(thread_id="t")
+    assert result["summary"]
+    assert "how do we chunk documents?" in state["summary"]
+    # Window of one turn: the stored transcript stops growing with the thread.
+    assert state["stored_turns"] == 1
+    assert state["stored_messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_summary_respects_the_character_budget():
+    agent = make_agent(
+        history_window_turns=1, summarize_after_turns=2, summary_max_chars=300
+    )
+    for i in range(5):
+        await agent.ask(f"how do we handle case {i} in our pipeline?", thread_id="t")
+    assert len((await agent.state(thread_id="t"))["summary"]) <= 300
+
+
+@pytest.mark.asyncio
+async def test_follow_up_survives_compaction_via_the_summary():
+    retriever = StubRetriever()
+    agent = make_agent(
+        retriever=retriever, history_window_turns=1, summarize_after_turns=2
+    )
+    await agent.ask("how do we embed documents?", thread_id="t")
+    await agent.ask("how do we deploy the api?", thread_id="t")
+    await agent.ask("what about that?", thread_id="t")
+
+    # The referenced turn is gone from the window, so the rewriter falls back
+    # to the summary rather than sending a bare pronoun to retrieval.
+    assert "context:" in retriever.calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_summarization_node_only_runs_when_needed():
+    agent = compacting_agent()
+    first = await agent.ask("how do we chunk documents?", thread_id="t")
+    assert not any("summarize_history" in entry for entry in first["trace"])
+
+    await agent.ask("how do we embed them?", thread_id="t")
+    third = await agent.ask("how do we deploy the api?", thread_id="t")
+    assert any("summarize_history" in entry for entry in third["trace"])
+
+
+# --- checkpoint inspection and time travel ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_state_reports_what_the_agent_remembers():
+    agent = make_agent()
+    await agent.ask("how do we chunk documents?", thread_id="t")
+    state = await agent.state(thread_id="t")
+
+    assert state["exists"] is True
+    assert state["turn_index"] == 1
+    assert state["stored_turns"] == 1
+    assert state["checkpoint_id"]
+    # The turn finished, so nothing is left to run.
+    assert state["next_nodes"] == []
+
+
+@pytest.mark.asyncio
+async def test_state_of_an_unknown_thread_is_empty():
+    agent = make_agent()
+    assert (await agent.state(thread_id="never-used"))["exists"] is False
+
+
+@pytest.mark.asyncio
+async def test_checkpoints_are_listed_newest_first():
+    agent = make_agent()
+    await agent.ask("how do we chunk documents?", thread_id="t")
+    await agent.ask("how do we deploy the api?", thread_id="t")
+
+    completed = [c for c in await agent.checkpoints(thread_id="t", limit=60) if not c["next_nodes"]]
+    assert [c["turn_index"] for c in completed] == [2, 1]
+    assert all(c["checkpoint_id"] for c in completed)
+
+
+async def completed_checkpoint(agent: ConversationAgent, thread_id: str, turn: int) -> str:
+    entries = await agent.checkpoints(thread_id=thread_id, limit=60)
+    return next(
+        c["checkpoint_id"]
+        for c in entries
+        if c["turn_index"] == turn and not c["next_nodes"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_forking_in_place_replaces_the_last_question():
+    agent = make_agent()
+    await agent.ask("how do we chunk documents?", thread_id="t")
+    await agent.ask("how do we deploy the api?", thread_id="t")
+    after_first = await completed_checkpoint(agent, "t", 1)
+
+    forked = await agent.fork(
+        "what about PII redaction?", thread_id="t", checkpoint_id=after_first
+    )
+    questions = [
+        entry["content"]
+        for entry in await agent.history(thread_id="t")
+        if entry["role"] == "human"
+    ]
+
+    assert forked["turn_index"] == 2
+    assert questions == ["how do we chunk documents?", "what about PII redaction?"]
+
+
+@pytest.mark.asyncio
+async def test_forking_into_a_new_thread_leaves_the_original_alone():
+    agent = make_agent()
+    await agent.ask("how do we chunk documents?", thread_id="t")
+    await agent.ask("how do we deploy the api?", thread_id="t")
+    after_first = await completed_checkpoint(agent, "t", 1)
+
+    await agent.fork(
+        "how do we handle retries?",
+        thread_id="t",
+        checkpoint_id=after_first,
+        into_thread_id="branch",
+    )
+
+    branch = [
+        entry["content"]
+        for entry in await agent.history(thread_id="branch")
+        if entry["role"] == "human"
+    ]
+    original = [
+        entry["content"]
+        for entry in await agent.history(thread_id="t")
+        if entry["role"] == "human"
+    ]
+    assert branch == ["how do we chunk documents?", "how do we handle retries?"]
+    assert original == ["how do we chunk documents?", "how do we deploy the api?"]
+
+
+@pytest.mark.asyncio
+async def test_forking_from_an_unknown_checkpoint_is_an_error():
+    agent = make_agent()
+    await agent.ask("how do we chunk documents?", thread_id="t")
+    with pytest.raises(ThreadNotFoundError):
+        await agent.fork(
+            "anything", thread_id="t", checkpoint_id="nope", into_thread_id="branch"
+        )
