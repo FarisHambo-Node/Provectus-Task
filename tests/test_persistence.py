@@ -1,6 +1,6 @@
 """Checkpointing: backend selection, durability, and degradation.
 
-The SQLite tests write to a tmp_path file and build a second agent against it,
+The SQLite tests write to a throwaway file and build a second agent against it,
 which is the closest thing to a process restart that a test can do.
 """
 
@@ -104,8 +104,8 @@ async def test_unknown_backend_is_a_configuration_error():
     assert "supported" in exc.value.context
 
 
-async def test_sqlite_backend_creates_its_file(tmp_path):
-    path = tmp_path / "nested" / "checkpoints.sqlite"
+async def test_sqlite_backend_creates_its_file(sqlite_path):
+    path = sqlite_path.parent / "nested" / "checkpoints.sqlite"
     settings = base_settings(checkpoint_backend="sqlite", checkpoint_path=str(path))
     async with checkpointer_scope(settings) as saver:
         assert isinstance(saver, ResilientCheckpointSaver)
@@ -115,10 +115,10 @@ async def test_sqlite_backend_creates_its_file(tmp_path):
 # --- durability ------------------------------------------------------------
 
 
-async def test_conversation_survives_a_new_agent_on_the_same_file(tmp_path):
+async def test_conversation_survives_a_new_agent_on_the_same_file(sqlite_path):
     settings = base_settings(
         checkpoint_backend="sqlite",
-        checkpoint_path=str(tmp_path / "ckpt.sqlite"),
+        checkpoint_path=str(sqlite_path),
     )
     async with ConversationAgent.session(
         build_container(settings, retriever=StubRetriever(), web_backend=StubWebBackend())
@@ -237,9 +237,9 @@ async def test_non_retryable_read_failure_fails_fast():
 # --- deletion --------------------------------------------------------------
 
 
-async def test_deleting_a_thread_forgets_it(tmp_path):
+async def test_deleting_a_thread_forgets_it(sqlite_path):
     settings = base_settings(
-        checkpoint_backend="sqlite", checkpoint_path=str(tmp_path / "ckpt.sqlite")
+        checkpoint_backend="sqlite", checkpoint_path=str(sqlite_path)
     )
     async with ConversationAgent.session(
         build_container(settings, retriever=StubRetriever(), web_backend=StubWebBackend())
