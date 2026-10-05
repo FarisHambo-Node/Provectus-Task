@@ -10,9 +10,11 @@ name in the list runs in the same superstep.
 
 from __future__ import annotations
 
-from agent.state import AgentState, TurnStatus, ToolName
+from agent.memory import should_summarize
+from agent.state import AgentState, ToolName, TurnStatus
 
 NODE_PREPARE = "prepare_turn"
+NODE_SUMMARIZE = "summarize_history"
 NODE_ANALYZE = "analyze_query"
 NODE_GATHER = "gather"
 NODE_SYNTHESIZE = "synthesize"
@@ -24,11 +26,26 @@ TOOL_NODES: dict[ToolName, str] = {
     ToolName.WEB_SEARCH: "web_search",
 }
 
+# Matches the Settings default; the graph binds the configured value.
+DEFAULT_SUMMARIZE_AFTER_TURNS = 8
 
-def route_after_prepare(state: AgentState) -> str:
-    """Skip planning when there is no question to plan for."""
+
+def route_after_prepare(
+    state: AgentState,
+    *,
+    summarize_after_turns: int = DEFAULT_SUMMARIZE_AFTER_TURNS,
+) -> str:
+    """Decide between clarifying, compacting memory, or planning.
+
+    Summarisation happens before planning so the planner and the query
+    rewriter see the compacted history rather than the raw transcript.
+    """
     if not state.get("query", "").strip():
         return NODE_CLARIFY
+    if should_summarize(
+        state.get("messages", []), summarize_after_turns=summarize_after_turns
+    ):
+        return NODE_SUMMARIZE
     return NODE_ANALYZE
 
 

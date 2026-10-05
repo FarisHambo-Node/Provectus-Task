@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.messages import AnyMessage, HumanMessage
 
 from agent.container import AgentContainer
+from agent.memory import count_turns, window
 from agent.nodes._common import node_span
 from agent.observability import TraceEvent
 from agent.state import AgentState, TurnStatus, new_turn_scratch
@@ -26,12 +27,8 @@ def latest_user_query(messages: list[AnyMessage]) -> str:
 
 
 def recent_history(messages: list[AnyMessage], *, window_turns: int) -> list[AnyMessage]:
-    """Keep the last `window_turns` exchanges verbatim.
-
-    Older turns belong in `summary`; trimming here is what stops a long thread
-    from crowding retrieved chunks out of the context window.
-    """
-    return list(messages or [])[-(window_turns * 2) :]
+    """The verbatim window. Older turns live in `summary`."""
+    return window(messages, window_turns=window_turns)
 
 
 async def prepare_turn(state: AgentState, container: AgentContainer) -> dict[str, Any]:
@@ -48,8 +45,13 @@ async def prepare_turn(state: AgentState, container: AgentContainer) -> dict[str
             messages, window_turns=container.settings.history_window_turns
         )
         attrs["query_chars"] = len(query)
-        attrs["history_messages"] = len(history)
+        attrs["stored_messages"] = len(messages)
+        attrs["stored_turns"] = count_turns(messages)
+        attrs["window_messages"] = len(history)
+        attrs["has_summary"] = bool(state.get("summary", ""))
         attrs["empty_query"] = not query
+        # Confirms the checkpointer actually reloaded prior state for this thread.
+        attrs["resumed"] = turn_index > 1
 
         update: dict[str, Any] = {
             **new_turn_scratch(),

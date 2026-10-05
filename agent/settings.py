@@ -58,6 +58,25 @@ class Settings(BaseModel):
     # Turns kept verbatim in the prompt before older ones get summarised.
     history_window_turns: int = Field(default=6, ge=1)
 
+    # --- Conversation memory ----------------------------------------------
+    # Summarise once the stored transcript exceeds this many turns. Summarising
+    # keeps the prompt small and the checkpoint cheap, at the cost of losing
+    # verbatim detail from older turns.
+    summarize_after_turns: int = Field(default=8, ge=2)
+    summary_max_chars: int = Field(default=1200, ge=200)
+
+    # --- Checkpointing ----------------------------------------------------
+    # memory = per-process (tests, demos), sqlite = durable local file.
+    checkpoint_backend: str = "memory"
+    checkpoint_path: str = ".agent_checkpoints.sqlite"
+    checkpoint_timeout_s: float = Field(default=3.0, gt=0)
+    checkpoint_max_attempts: int = Field(default=3, ge=1, le=10)
+    # Fail open: a checkpoint-store outage degrades the conversation to
+    # stateless instead of failing the request. Losing history beats a 500,
+    # but it is loud in logs and metrics because it is silent data loss.
+    checkpoint_fail_open_reads: bool = True
+    checkpoint_fail_open_writes: bool = True
+
     # --- Simulation knobs (skeleton only, remove once AWS is wired in) -----
     simulate_latency: bool = True
     simulated_failure_rate: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -89,6 +108,14 @@ class Settings(BaseModel):
             "enable_web_search": _as_bool(os.getenv("ENABLE_WEB_SEARCH")),
             "max_tool_calls_per_turn": os.getenv("MAX_TOOL_CALLS_PER_TURN"),
             "history_window_turns": os.getenv("HISTORY_WINDOW_TURNS"),
+            "summarize_after_turns": os.getenv("SUMMARIZE_AFTER_TURNS"),
+            "summary_max_chars": os.getenv("SUMMARY_MAX_CHARS"),
+            "checkpoint_backend": os.getenv("CHECKPOINT_BACKEND"),
+            "checkpoint_path": os.getenv("CHECKPOINT_PATH"),
+            "checkpoint_timeout_s": os.getenv("CHECKPOINT_TIMEOUT_S"),
+            "checkpoint_max_attempts": os.getenv("CHECKPOINT_MAX_ATTEMPTS"),
+            "checkpoint_fail_open_reads": _as_bool(os.getenv("CHECKPOINT_FAIL_OPEN_READS")),
+            "checkpoint_fail_open_writes": _as_bool(os.getenv("CHECKPOINT_FAIL_OPEN_WRITES")),
             "simulate_latency": _as_bool(os.getenv("SIMULATE_LATENCY")),
             "simulated_failure_rate": os.getenv("SIMULATED_FAILURE_RATE"),
             "random_seed": os.getenv("RANDOM_SEED"),
@@ -115,6 +142,15 @@ class Settings(BaseModel):
             raise ConfigurationError(
                 "opensearch_service must be 'es' (domain) or 'aoss' (serverless)",
                 context={"value": settings.opensearch_service},
+            )
+        if settings.summarize_after_turns <= settings.history_window_turns:
+            raise ConfigurationError(
+                "summarize_after_turns must exceed history_window_turns, "
+                "otherwise every turn triggers a summary",
+                context={
+                    "summarize_after_turns": settings.summarize_after_turns,
+                    "history_window_turns": settings.history_window_turns,
+                },
             )
         return settings
 

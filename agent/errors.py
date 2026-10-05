@@ -58,6 +58,19 @@ class PlanningError(AgentError):
     code = "planning_error"
 
 
+class ThreadNotFoundError(AgentError):
+    """The requested conversation thread or checkpoint does not exist."""
+
+    code = "thread_not_found"
+
+
+class CheckpointError(AgentError):
+    """The conversation store could not be read or written."""
+
+    code = "checkpoint_error"
+    retryable = True
+
+
 class SynthesisError(AgentError):
     """The answer generator failed or returned something unusable."""
 

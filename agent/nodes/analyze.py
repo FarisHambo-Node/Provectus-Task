@@ -19,6 +19,7 @@ from langchain_core.messages import AnyMessage
 
 from agent.container import AgentContainer
 from agent.errors import AgentError, PlanningError
+from agent.memory import window
 from agent.nodes._common import node_span
 from agent.observability import TraceEvent
 from agent.settings import Settings
@@ -49,23 +50,35 @@ def looks_like_follow_up(query: str) -> bool:
     return any(marker in f" {lowered} " for marker in FOLLOW_UP_MARKERS)
 
 
-def resolve_query(query: str, history: list[AnyMessage]) -> str:
+def resolve_query(query: str, history: list[AnyMessage], summary: str = "") -> str:
     """Make the query self-contained before it reaches a tool.
 
+    Prefers the previous question from the live window, and falls back to the
+    rolling summary once that turn has been compacted away — otherwise a
+    follow-up in a long thread loses its referent and retrieval goes blind.
+
     TODO: real coreference resolution via a cheap LLM call over the last two
-    turns. For now we append the previous user question as context, which is
-    enough to keep retrieval from going blind on "what about that one?".
+    turns; this keyword approach is the weakest part of the planner.
     """
-    if not looks_like_follow_up(query) or not history:
+    if not looks_like_follow_up(query):
         return query
     previous = [
         str(message.content).strip()
-        for message in history[:-1]
+        for message in (history or [])[:-1]
         if getattr(message, "type", None) == "human"
     ]
-    if not previous:
-        return query
-    return f"{query} (context: {previous[-1]})"
+    if previous:
+        return f"{query} (context: {previous[-1]})"
+    if summary.strip():
+        return f"{query} (context: {_summary_tail(summary)})"
+    return query
+
+
+def _summary_tail(summary: str, max_chars: int = 240) -> str:
+    """The most recent lines of the summary, which are the relevant ones."""
+    tail = summary.strip().split("\n")[-2:]
+    joined = " ".join(line.strip() for line in tail)
+    return joined if len(joined) <= max_chars else joined[-max_chars:]
 
 
 def plan_tools(
@@ -74,6 +87,7 @@ def plan_tools(
     specs: list[ToolSpec],
     settings: Settings,
     history: list[AnyMessage] | None = None,
+    summary: str = "",
 ) -> ToolPlan:
     """Pick tools for a query. Pure, deterministic, no I/O."""
     cleaned = query.strip()
@@ -112,7 +126,7 @@ def plan_tools(
         rationale="; ".join(reasons),
         confidence=confidence,
         needs_clarification=not selected,
-        search_query=resolve_query(cleaned, history or []),
+        search_query=resolve_query(cleaned, history or [], summary),
     )
 
 
@@ -120,12 +134,18 @@ async def analyze_query(state: AgentState, container: AgentContainer) -> dict[st
     trace: list[TraceEvent] = []
     async with node_span("analyze_query", state, container, trace) as attrs:
         query = state.get("query", "")
+        summary = state.get("summary", "")
+        attrs["has_summary"] = bool(summary)
         try:
             plan = plan_tools(
                 query,
                 specs=container.registry.specs(),
                 settings=container.settings,
-                history=state.get("messages", []),
+                history=window(
+                    state.get("messages", []),
+                    window_turns=container.settings.history_window_turns,
+                ),
+                summary=summary,
             )
         except AgentError:
             raise
