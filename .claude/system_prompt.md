@@ -1,0 +1,1 @@
+We need to Production-ready error handling. Other things can be so-so. But error handling must be very good. Monitoring is also very welcomed, since we want to keep track of what is happening in general, prior to inducing a bug/an error.

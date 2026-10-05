@@ -1,0 +1,9 @@
+boto3>=1.35
+opensearch-py[async]>=2.7
+langchain>=0.3
+langgraph>=0.2
+langchain-aws>=0.2
+pydantic>=2
+python-dotenv>=1
+numpy>=2
+pytest>=8
