@@ -1,6 +1,29 @@
 # Lokalni setup za intervju
 
-Python okruženje je u `.venv`. Nema starter koda. Na intervjuu kucaš sam.
+Python okruženje je u `.venv`.
+
+## Agentic RAG skeleton
+
+```bash
+source .venv/bin/activate
+python -m agent.run                                  # multi-turn REPL
+python -m agent.run --trace "how do we chunk docs?"  # one turn + trace
+python -m agent.run --failure-rate 1.0 "..."         # exercise the degraded path
+pytest
+```
+
+Layout:
+
+| Path | Role |
+| --- | --- |
+| `agent/graph.py`, `agent/routing.py` | LangGraph wiring, conditional edges, `ConversationAgent` |
+| `agent/state.py` | `AgentState` channels and reducers |
+| `agent/nodes/` | one file per node: prepare, analyze, tools, gather, synthesize, recovery |
+| `agent/tools/` | tool contract, resilience (timeout/retry/breaker), registry, two tools |
+| `agent/rag/` | simulated document store: 20-doc corpus plus a `Retriever` |
+| `agent/errors.py`, `agent/observability.py` | error taxonomy, structured logs, spans, metrics |
+
+Everything AWS-facing is simulated and marked with a `TODO` at the swap point.
 
 Vodiči, na engleskom, da možeš da vežbaš odgovor naglas:
 
