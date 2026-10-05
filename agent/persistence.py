@@ -34,7 +34,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.memory import InMemorySaver
 
-from agent.errors import ConfigurationError
+from agent.errors import CheckpointError, ConfigurationError
 from agent.observability import MetricsSink, StructuredLogger, get_logger
 from agent.settings import Settings
 from agent.tools.resilience import ResiliencePolicy, call_with_resilience
@@ -291,7 +291,7 @@ class ResilientCheckpointSaver(BaseCheckpointSaver):
         config: Any,
         allowed: bool,
     ) -> None:
-        """Record the failure, then either swallow it or let it through."""
+        """Record the failure, then either swallow it or re-raise it typed."""
         if isinstance(exc, asyncio.CancelledError):
             raise exc
         thread_id = (config or {}).get("configurable", {}).get("thread_id")
@@ -307,7 +307,14 @@ class ResilientCheckpointSaver(BaseCheckpointSaver):
             error=repr(exc),
         )
         if not allowed:
-            raise exc
+            raise CheckpointError(
+                f"checkpoint {operation} failed",
+                context={
+                    "operation": operation,
+                    "thread_id": thread_id,
+                    "cause": repr(exc),
+                },
+            ) from exc
 
 
 def _synthetic_config(config: Any, checkpoint: Checkpoint) -> dict[str, Any]:
