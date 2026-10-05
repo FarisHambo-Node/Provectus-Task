@@ -111,10 +111,18 @@ def build_graph(
     # Tool branches converge on the join node; gather runs once, after both.
     builder.add_edge(NODE_RAG, NODE_GATHER)
     builder.add_edge(NODE_WEB, NODE_GATHER)
+    # The replan edge back to the planner is the only cycle in the graph.
+    # `can_replan` bounds it three ways: replan count, tool budget, and
+    # whether any untried tool is left.
     builder.add_conditional_edges(
         NODE_GATHER,
-        route_after_gather,
-        [NODE_SYNTHESIZE, NODE_FAILURE, NODE_CLARIFY],
+        partial(
+            route_after_gather,
+            max_tool_calls_per_turn=container.settings.max_tool_calls_per_turn,
+            max_replans=container.settings.max_replans,
+            known_tools=tuple(container.registry.names()),
+        ),
+        [NODE_SYNTHESIZE, NODE_FAILURE, NODE_CLARIFY, NODE_ANALYZE],
     )
     builder.add_edge(NODE_SYNTHESIZE, END)
     builder.add_edge(NODE_CLARIFY, END)
@@ -283,7 +291,12 @@ class ConversationAgent:
         configurable: dict[str, Any] = {"thread_id": thread_id}
         if checkpoint_id:
             configurable["checkpoint_id"] = checkpoint_id
-        return {"configurable": configurable}
+        # Backstop on the replan cycle, independent of `can_replan`: if a
+        # routing bug ever made the loop unbounded, this ends the turn.
+        return {
+            "configurable": configurable,
+            "recursion_limit": self.container.settings.graph_recursion_limit,
+        }
 
     def _summarize_turn(self, thread_id: str, final: AgentState) -> dict[str, Any]:
         return {
@@ -294,6 +307,7 @@ class ConversationAgent:
             "citations": [c.model_dump() for c in final.get("citations", [])],
             "tools_used": [inv.tool for inv in final.get("invocations", []) if inv.ok],
             "tool_calls_used": final.get("tool_calls_used", 0),
+            "replans": final.get("replan_count", 0),
             "failures": final.get("failures", []),
             "summary": final.get("summary", ""),
             "stored_turns": count_turns(final.get("messages", [])),

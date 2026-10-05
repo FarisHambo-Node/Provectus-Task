@@ -13,6 +13,7 @@ answering during a Bedrock outage.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from langchain_core.messages import AnyMessage
@@ -23,7 +24,7 @@ from agent.memory import window
 from agent.nodes._common import node_span
 from agent.observability import TraceEvent
 from agent.settings import Settings
-from agent.state import AgentState, ToolName, ToolPlan, TurnStatus
+from agent.state import AgentState, ToolName, ToolPlan, TurnStatus, attempted_tools
 from agent.tools.base import ToolSpec
 
 MIN_QUERY_CHARS = 3
@@ -88,8 +89,15 @@ def plan_tools(
     settings: Settings,
     history: list[AnyMessage] | None = None,
     summary: str = "",
+    exclude: Collection[ToolName] = (),
 ) -> ToolPlan:
-    """Pick tools for a query. Pure, deterministic, no I/O."""
+    """Pick tools for a query. Pure, deterministic, no I/O.
+
+    `exclude` holds tools this turn already tried. A non-empty `exclude` means
+    this is a replan, which changes the fallback: instead of reaching for the
+    default tool, escalate to whatever has not been tried yet. That is what
+    turns "internal docs came back empty" into a web search.
+    """
     cleaned = query.strip()
     if len(cleaned) < MIN_QUERY_CHARS:
         return ToolPlan(
@@ -100,18 +108,31 @@ def plan_tools(
             search_query=cleaned,
         )
 
+    candidates = [spec for spec in specs if spec.name not in set(exclude)]
+    if not candidates:
+        return ToolPlan(
+            tools=[],
+            rationale="every tool has already been tried this turn",
+            confidence=0.0,
+            needs_clarification=True,
+            search_query=cleaned,
+        )
+
     scored = sorted(
-        ((spec, keyword_score(cleaned, spec)) for spec in specs),
+        ((spec, keyword_score(cleaned, spec)) for spec in candidates),
         key=lambda pair: pair[1],
         reverse=True,
     )
     selected: list[ToolName] = [spec.name for spec, score in scored if score > 0.0]
     reasons = [f"{spec.name}={score:.2f}" for spec, score in scored]
 
-    if not selected:
+    if not selected and exclude:
+        selected = [spec.name for spec in candidates]
+        reasons.append("replan: escalating to untried tools")
+    elif not selected:
         # Unmatched questions are far more often about internal docs than the
         # web, so the default tool answers rather than asking for clarification.
-        selected = [spec.name for spec in specs if spec.is_default]
+        selected = [spec.name for spec in candidates if spec.is_default]
         reasons.append("fell back to default tool")
 
     if not settings.enable_web_search:
@@ -135,7 +156,11 @@ async def analyze_query(state: AgentState, container: AgentContainer) -> dict[st
     async with node_span("analyze_query", state, container, trace) as attrs:
         query = state.get("query", "")
         summary = state.get("summary", "")
+        tried = attempted_tools(state)
+        is_replan = bool(tried)
         attrs["has_summary"] = bool(summary)
+        attrs["replan"] = is_replan
+        attrs["already_tried"] = [str(name) for name in sorted(tried)]
         try:
             plan = plan_tools(
                 query,
@@ -146,6 +171,7 @@ async def analyze_query(state: AgentState, container: AgentContainer) -> dict[st
                     window_turns=container.settings.history_window_turns,
                 ),
                 summary=summary,
+                exclude=tried,
             )
         except AgentError:
             raise
@@ -178,4 +204,16 @@ async def analyze_query(state: AgentState, container: AgentContainer) -> dict[st
         update: dict[str, Any] = {"plan": plan, "trace": trace}
         if plan.needs_clarification or plan.confidence < CLARIFICATION_CONFIDENCE:
             update["status"] = TurnStatus.NEEDS_CLARIFICATION
+        else:
+            # Clear the failed status gather set before it routed back here,
+            # so the retry is judged on its own result.
+            update["status"] = TurnStatus.PENDING
+        if is_replan:
+            update["replan_count"] = 1
+            container.metrics.increment("turn.replan")
+            container.logger.info(
+                "turn.replan",
+                already_tried=[str(name) for name in sorted(tried)],
+                now_trying=[str(name) for name in plan.tools],
+            )
         return update

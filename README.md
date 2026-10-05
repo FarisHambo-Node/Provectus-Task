@@ -14,18 +14,18 @@ in the code.
 | --- | --- |
 | Analyse the query to determine needed tools | `agent/nodes/analyze.py` → `plan_tools` |
 | Call a RAG tool to search internal docs | `agent/tools/rag_tool.py` over `agent/rag/` |
-| Optionally call a web search tool | `agent/tools/web_search_tool.py`, selected only when the query needs it |
+| Optionally call a web search tool | `agent/tools/web_search_tool.py`, selected when the query needs it or escalated to when internal docs come back empty |
 | Synthesise a final answer with citations | `agent/nodes/synthesize.py` → `build_citations`, `render_answer`, `verify_grounding` |
 | State management for multi-turn conversations | `agent/state.py` channels and reducers, `agent/memory.py` window and summary |
 | LangGraph orchestration | `agent/graph.py` |
-| Conditional edges for routing | `agent/routing.py`, four conditional edges |
-| Circuit breaker: max tool calls | `remaining_tool_budget` in `agent/state.py`, enforced in `route_after_analysis` and again in the tool nodes |
+| Conditional edges for routing | `agent/routing.py`, four conditional edges including the replan cycle |
+| Circuit breaker: max tool calls | `remaining_tool_budget` in `agent/state.py`, enforced in `route_after_analysis`, `can_replan`, and again in the tool nodes |
 | Circuit breaker: failing dependency | `CircuitBreaker` in `agent/tools/resilience.py` |
 | Checkpointing for conversation persistence | `agent/persistence.py`, SQLite backend, verified across process restarts |
 | Production-ready error handling | `agent/errors.py` taxonomy, `Tool.run` error boundary, `ResilientCheckpointSaver`, degraded and refusal paths |
 | Mocked RAG and web search | `agent/rag/retriever.py`, `SimulatedWebBackend` |
 
-126 tests, no network and no AWS: `pytest`.
+143 tests, no network and no AWS: `pytest`.
 
 ## Requirements
 
@@ -175,9 +175,11 @@ graph TD;
 	analyze_query -.-> rag_search;
 	analyze_query -.-> web_search;
 	analyze_query -.-> clarify;
+	analyze_query -.-> handle_failure;
 	rag_search --> gather;
 	web_search --> gather;
 	gather -.-> synthesize;
+	gather -.-> analyze_query;
 	gather -.-> handle_failure;
 	gather -.-> clarify;
 	clarify --> __end__;
@@ -208,6 +210,27 @@ What each node does:
 fans out: every name runs in the same superstep. The explicit `gather` join
 matters — without it, a turn where retrieval succeeded and web search failed
 would route to two different nodes at once.
+
+### The replan loop
+
+`gather → analyze_query` is the only cycle in the graph, and it is what makes
+web search a genuine fallback rather than a keyword guess made up front: a
+question the internal docs cannot answer escalates to an untried tool instead
+of being refused on the first miss.
+
+`can_replan` bounds the loop three ways, and all three must hold:
+
+| Guard | Stops |
+| --- | --- |
+| `MAX_REPLANS` | unbounded iteration |
+| remaining tool budget | unbounded spend |
+| an untried tool exists | re-running a tool that already came back empty |
+
+`GRAPH_RECURSION_LIMIT` is the backstop underneath all of that, in case a
+routing bug ever makes the cycle unbounded.
+
+On a replan the planner receives the set of already-attempted tools and
+excludes them, so the second pass escalates rather than repeating itself.
 
 ## Layout
 
@@ -334,7 +357,7 @@ There are two circuit breakers, and they trip on different things:
 
 | Breaker | Trips on | Effect |
 | --- | --- | --- |
-| tool-call budget (`MAX_TOOL_CALLS_PER_TURN`) | too many tool calls in one turn | caps the blast radius of a bad plan or a replan loop; the fan-out is clipped before the calls are made |
+| tool-call budget (`MAX_TOOL_CALLS_PER_TURN`) | too many tool calls in one turn | caps the blast radius of a bad plan or the replan loop; the fan-out is clipped before the calls are made |
 | dependency breaker (`CircuitBreaker`) | consecutive failures from one tool | stops hammering a dead dependency, half-opens after a cooldown to probe |
 
 The rest of the error handling:
@@ -367,6 +390,8 @@ Full list with defaults in `.env.example`. The ones worth knowing:
 | `TOOL_MAX_ATTEMPTS` | `3` | only `retryable` errors are retried |
 | `TOOL_MAX_CONCURRENCY` | `4` | caps blocking-call fan-out |
 | `MAX_TOOL_CALLS_PER_TURN` | `4` | the tool-call circuit breaker |
+| `MAX_REPLANS` | `1` | retries after an empty first pass; `0` disables the loop |
+| `GRAPH_RECURSION_LIMIT` | `25` | backstop on graph supersteps |
 | `ENABLE_WEB_SEARCH` | `true` | set to `false` to run internal-docs only |
 | `HISTORY_WINDOW_TURNS` | `6` | turns kept verbatim before older ones get summarised |
 | `SUMMARIZE_AFTER_TURNS` | `8` | must exceed the window, or every turn triggers a summary |

@@ -78,6 +78,9 @@ async def _invoke_tool(
             # One call spent, success or not: a failing tool still costs time
             # and money, so it has to count against the breaker.
             "tool_calls_used": 1,
+            # Marks the tool as tried so a replan escalates instead of
+            # repeating the same call forever.
+            "attempted_tools": [tool_name],
             "trace": trace,
         }
         if result.ok:

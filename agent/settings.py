@@ -55,6 +55,12 @@ class Settings(BaseModel):
     # --- Orchestration -----------------------------------------------------
     enable_web_search: bool = True
     max_tool_calls_per_turn: int = Field(default=4, ge=1)
+    # How many times a turn may re-plan after coming back empty-handed. Each
+    # replan buys another shot at an answer for another round of tool latency,
+    # so it is bounded and spends from the same tool-call budget.
+    max_replans: int = Field(default=1, ge=0, le=3)
+    # Hard stop on graph supersteps, independent of the replan counter.
+    graph_recursion_limit: int = Field(default=25, ge=5)
     # Turns kept verbatim in the prompt before older ones get summarised.
     history_window_turns: int = Field(default=6, ge=1)
 
@@ -107,6 +113,8 @@ class Settings(BaseModel):
             "tool_max_concurrency": os.getenv("TOOL_MAX_CONCURRENCY"),
             "enable_web_search": _as_bool(os.getenv("ENABLE_WEB_SEARCH")),
             "max_tool_calls_per_turn": os.getenv("MAX_TOOL_CALLS_PER_TURN"),
+            "max_replans": os.getenv("MAX_REPLANS"),
+            "graph_recursion_limit": os.getenv("GRAPH_RECURSION_LIMIT"),
             "history_window_turns": os.getenv("HISTORY_WINDOW_TURNS"),
             "summarize_after_turns": os.getenv("SUMMARIZE_AFTER_TURNS"),
             "summary_max_chars": os.getenv("SUMMARY_MAX_CHARS"),

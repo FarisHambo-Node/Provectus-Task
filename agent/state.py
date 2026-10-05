@@ -14,6 +14,7 @@ branch returns only its own slice and LangGraph merges them.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, TypedDict, TypeVar
@@ -222,6 +223,10 @@ class AgentState(TypedDict, total=False):
     status: TurnStatus
     # Spend against the per-turn tool budget. See `remaining_tool_budget`.
     tool_calls_used: Annotated[int, add_counts]
+    # Replan bookkeeping: which tools this turn already tried, and how many
+    # times it has looped back to the planner.
+    attempted_tools: Annotated[list[ToolName], accumulate]
+    replan_count: Annotated[int, add_counts]
 
     # -- thread-level diagnostics -----------------------------------------
     trace: Annotated[list[TraceEvent], accumulate_trace]
@@ -239,7 +244,19 @@ def new_turn_scratch() -> dict[str, Any]:
         "answer": "",
         "status": TurnStatus.PENDING,
         "tool_calls_used": None,
+        "attempted_tools": None,
+        "replan_count": None,
     }
+
+
+def attempted_tools(state: AgentState) -> set[ToolName]:
+    return set(state.get("attempted_tools", []))
+
+
+def untried_tools(state: AgentState, known: Iterable[ToolName]) -> list[ToolName]:
+    """Tools this turn has not called yet. The fuel for a replan."""
+    tried = attempted_tools(state)
+    return [name for name in known if name not in tried]
 
 
 def remaining_tool_budget(state: AgentState, limit: int) -> int:

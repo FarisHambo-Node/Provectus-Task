@@ -10,8 +10,16 @@ name in the list runs in the same superstep.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from agent.memory import should_summarize
-from agent.state import AgentState, ToolName, TurnStatus, remaining_tool_budget
+from agent.state import (
+    AgentState,
+    ToolName,
+    TurnStatus,
+    remaining_tool_budget,
+    untried_tools,
+)
 
 NODE_PREPARE = "prepare_turn"
 NODE_SUMMARIZE = "summarize_history"
@@ -29,6 +37,7 @@ TOOL_NODES: dict[ToolName, str] = {
 # Match the Settings defaults; the graph binds the configured values.
 DEFAULT_SUMMARIZE_AFTER_TURNS = 8
 DEFAULT_MAX_TOOL_CALLS = 4
+DEFAULT_MAX_REPLANS = 1
 
 
 def route_after_prepare(
@@ -83,15 +92,49 @@ def route_after_analysis(
     return targets[:budget]
 
 
-def route_after_gather(state: AgentState) -> str:
-    """Synthesise only with evidence in hand; otherwise take the failure path."""
-    status = state.get("status")
-    if status == TurnStatus.NEEDS_CLARIFICATION:
+def can_replan(
+    state: AgentState,
+    *,
+    max_tool_calls_per_turn: int,
+    max_replans: int,
+    known_tools: Collection[ToolName],
+) -> bool:
+    """Whether a second pass is worth it. All three guards must hold.
+
+    Together they make the loop provably finite: the replan counter bounds the
+    iterations, the budget bounds the spend, and the untried-tool check stops
+    the agent from re-running a tool that already came back empty.
+    """
+    if state.get("replan_count", 0) >= max_replans:
+        return False
+    if remaining_tool_budget(state, max_tool_calls_per_turn) <= 0:
+        return False
+    return bool(untried_tools(state, known_tools))
+
+
+def route_after_gather(
+    state: AgentState,
+    *,
+    max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS,
+    max_replans: int = DEFAULT_MAX_REPLANS,
+    known_tools: Collection[ToolName] = (),
+) -> str:
+    """Synthesise with evidence, retry once without it, otherwise refuse.
+
+    The replan branch is what makes web search a genuine fallback: a question
+    the internal docs cannot answer escalates to an untried tool instead of
+    being refused on the first miss.
+    """
+    if state.get("status") == TurnStatus.NEEDS_CLARIFICATION:
         return NODE_CLARIFY
-    if status == TurnStatus.FAILED:
-        return NODE_FAILURE
-    if not (state.get("chunks") or state.get("web_results")):
-        # Belt and braces: never let a status mismatch reach the synthesiser,
-        # which would have to invent an answer.
-        return NODE_FAILURE
-    return NODE_SYNTHESIZE
+    if state.get("chunks") or state.get("web_results"):
+        return NODE_SYNTHESIZE
+    if can_replan(
+        state,
+        max_tool_calls_per_turn=max_tool_calls_per_turn,
+        max_replans=max_replans,
+        known_tools=known_tools,
+    ):
+        return NODE_ANALYZE
+    # No evidence and nothing left to try: refuse rather than invent.
+    return NODE_FAILURE

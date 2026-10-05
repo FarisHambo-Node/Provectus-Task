@@ -123,7 +123,10 @@ async def test_turn_is_degraded_when_one_tool_fails_but_the_other_succeeds():
 
 @pytest.mark.asyncio
 async def test_turn_refuses_when_every_tool_fails():
-    agent = make_agent(retriever=StubRetriever(error=RetrievalError("503", tool="rag_search")))
+    agent = make_agent(
+        retriever=StubRetriever(error=RetrievalError("503", tool="rag_search")),
+        web_backend=StubWebBackend(error=ToolThrottledError("429", tool="web_search")),
+    )
     result = await agent.ask("where is our chunking configuration documented?")
 
     assert result["status"] == "failed"
@@ -132,12 +135,95 @@ async def test_turn_refuses_when_every_tool_fails():
 
 
 @pytest.mark.asyncio
-async def test_empty_retrieval_refuses_instead_of_inventing_an_answer():
-    agent = make_agent(retriever=StubRetriever(count=0))
+async def test_refuses_when_retrieval_is_empty_and_nothing_can_be_escalated_to():
+    agent = make_agent(retriever=StubRetriever(count=0), enable_web_search=False)
     result = await agent.ask("where is our chunking configuration documented?")
 
     assert result["status"] == "failed"
     assert result["citations"] == []
+    assert result["replans"] == 0
+
+
+# --- replan loop -----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_retrieval_escalates_to_web_search():
+    web = StubWebBackend()
+    agent = make_agent(retriever=StubRetriever(count=0), web_backend=web)
+    result = await agent.ask("where is our chunking configuration documented?")
+
+    # The planner picks no web keywords from this query, so the only reason
+    # web search ran is the replan escalation.
+    assert result["replans"] == 1
+    assert len(web.calls) == 1
+    assert result["status"] == "ok"
+    assert {c["origin"] for c in result["citations"]} == {"web"}
+
+
+@pytest.mark.asyncio
+async def test_failed_retrieval_escalates_and_answers_degraded():
+    agent = make_agent(
+        retriever=StubRetriever(error=RetrievalError("503", tool="rag_search"))
+    )
+    result = await agent.ask("where is our chunking configuration documented?")
+
+    assert result["replans"] == 1
+    assert result["tools_used"] == ["web_search"]
+    assert result["status"] == "degraded"
+    assert "Caveats:" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_a_successful_first_pass_does_not_replan():
+    agent = make_agent()
+    result = await agent.ask("where is our chunking configuration documented?")
+    assert result["replans"] == 0
+    assert result["tool_calls_used"] == 1
+
+
+@pytest.mark.asyncio
+async def test_replan_does_not_repeat_an_already_tried_tool():
+    retriever = StubRetriever(count=0)
+    agent = make_agent(retriever=retriever, web_backend=StubWebBackend(count=0))
+    result = await agent.ask("where is our chunking configuration documented?")
+
+    # Both tools tried exactly once, then it gives up instead of looping.
+    assert len(retriever.calls) == 1
+    assert result["tool_calls_used"] == 2
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_replan_is_capped_by_max_replans():
+    agent = make_agent(retriever=StubRetriever(count=0), max_replans=0)
+    result = await agent.ask("where is our chunking configuration documented?")
+
+    assert result["replans"] == 0
+    assert result["tool_calls_used"] == 1
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_replan_is_capped_by_the_tool_budget():
+    web = StubWebBackend()
+    agent = make_agent(
+        retriever=StubRetriever(count=0), web_backend=web, max_tool_calls_per_turn=1
+    )
+    result = await agent.ask("where is our chunking configuration documented?")
+
+    # The budget breaker wins over the replan allowance.
+    assert result["tool_calls_used"] == 1
+    assert web.calls == []
+    assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_replan_shows_up_in_the_trace():
+    agent = make_agent(retriever=StubRetriever(count=0))
+    result = await agent.ask("where is our chunking configuration documented?")
+    analyses = [entry for entry in result["trace"] if "node.analyze_query" in entry]
+    assert len(analyses) == 2
 
 
 @pytest.mark.asyncio
@@ -198,7 +284,10 @@ async def test_follow_up_query_is_rewritten_before_retrieval():
 @pytest.mark.asyncio
 async def test_a_failed_turn_does_not_break_the_next_one():
     retriever = StubRetriever(error=RetrievalError("503", tool="rag_search"))
-    agent = make_agent(retriever=retriever)
+    agent = make_agent(
+        retriever=retriever,
+        web_backend=StubWebBackend(error=ToolThrottledError("429", tool="web_search")),
+    )
     failed = await agent.ask("where is our chunking doc?", thread_id="t4")
     retriever.error = None
     recovered = await agent.ask("where is our chunking doc?", thread_id="t4")
@@ -206,6 +295,8 @@ async def test_a_failed_turn_does_not_break_the_next_one():
     assert failed["status"] == "failed"
     assert recovered["status"] == "ok"
     assert recovered["failures"] == []
+    # Replan bookkeeping is per-turn, like every other scratch channel.
+    assert recovered["replans"] == 0
 
 
 # --- observability ---------------------------------------------------------

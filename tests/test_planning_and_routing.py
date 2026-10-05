@@ -10,6 +10,7 @@ from agent.routing import (
     NODE_CLARIFY,
     NODE_FAILURE,
     NODE_SYNTHESIZE,
+    can_replan,
     route_after_analysis,
     route_after_gather,
     route_after_prepare,
@@ -176,3 +177,95 @@ def test_budget_counter_sums_across_parallel_branches():
     # Each tool node reports one call; the reducer has to add, not overwrite.
     assert add_counts(add_counts(0, 1), 1) == 2
     assert add_counts(5, None) == 0
+
+
+# --- replan loop -----------------------------------------------------------
+
+
+def test_replan_escalates_to_an_untried_tool():
+    # No web keywords in this query, so only the escalation can pick web.
+    result = plan_tools(
+        "where is our chunking configuration documented?",
+        specs=ALL_SPECS,
+        settings=Settings(),
+        exclude={ToolName.RAG_SEARCH},
+    )
+    assert result.tools == [ToolName.WEB_SEARCH]
+    assert "escalating" in result.rationale
+
+
+def test_first_pass_falls_back_to_the_default_tool_not_escalation():
+    result = plan("explain reciprocal degradation in sparse manifolds")
+    assert result.tools == [ToolName.RAG_SEARCH]
+    assert "escalating" not in result.rationale
+
+
+def test_planning_with_every_tool_exhausted_asks_for_clarification():
+    result = plan_tools(
+        "where is our chunking configuration documented?",
+        specs=ALL_SPECS,
+        settings=Settings(),
+        exclude={ToolName.RAG_SEARCH, ToolName.WEB_SEARCH},
+    )
+    assert result.tools == []
+    assert result.needs_clarification is True
+
+
+REPLAN_GUARDS = {
+    "max_tool_calls_per_turn": 4,
+    "max_replans": 1,
+    "known_tools": [ToolName.RAG_SEARCH, ToolName.WEB_SEARCH],
+}
+
+
+def test_replan_allowed_after_one_empty_tool():
+    state = {"attempted_tools": [ToolName.RAG_SEARCH], "tool_calls_used": 1}
+    assert can_replan(state, **REPLAN_GUARDS) is True
+
+
+def test_replan_blocked_once_every_tool_has_been_tried():
+    state = {
+        "attempted_tools": [ToolName.RAG_SEARCH, ToolName.WEB_SEARCH],
+        "tool_calls_used": 2,
+    }
+    assert can_replan(state, **REPLAN_GUARDS) is False
+
+
+def test_replan_blocked_by_the_replan_cap():
+    state = {"attempted_tools": [ToolName.RAG_SEARCH], "replan_count": 1}
+    assert can_replan(state, **REPLAN_GUARDS) is False
+
+
+def test_replan_blocked_by_the_tool_budget():
+    state = {"attempted_tools": [ToolName.RAG_SEARCH], "tool_calls_used": 4}
+    assert can_replan(state, **REPLAN_GUARDS) is False
+
+
+def test_gather_routes_back_to_the_planner_when_a_retry_is_possible():
+    state = {"attempted_tools": [ToolName.RAG_SEARCH], "tool_calls_used": 1}
+    assert route_after_gather(state, **REPLAN_GUARDS) == NODE_ANALYZE
+
+
+def test_gather_refuses_once_the_retry_options_run_out():
+    state = {
+        "attempted_tools": [ToolName.RAG_SEARCH, ToolName.WEB_SEARCH],
+        "tool_calls_used": 2,
+    }
+    assert route_after_gather(state, **REPLAN_GUARDS) == NODE_FAILURE
+
+
+def test_evidence_always_wins_over_a_retry():
+    state = {
+        "attempted_tools": [ToolName.RAG_SEARCH],
+        "chunks": [
+            RetrievedChunk(
+                chunk_id="a#0",
+                doc_id="a",
+                title="t",
+                source_uri="s3://a",
+                text="body",
+                score=0.7,
+            )
+        ],
+    }
+    assert route_after_gather(state, **REPLAN_GUARDS) == NODE_SYNTHESIZE
