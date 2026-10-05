@@ -168,6 +168,18 @@ def replace(left: T | None, right: T | None) -> T | None:
     return right
 
 
+def add_counts(left: int | None, right: int | None) -> int:
+    """Summing reducer for per-turn counters; a `None` write resets to zero.
+
+    Summing rather than replacing is what makes the tool-call budget correct
+    when branches run in parallel: each tool node reports its own single call
+    and the channel ends up with the real total.
+    """
+    if right is None:
+        return 0
+    return (left or 0) + right
+
+
 # The trace spans the whole thread, not one turn, because the interesting
 # questions in a multi-turn session ("why did turn 3 stop using retrieval?")
 # need the earlier turns. Bounded so a long thread cannot grow without limit.
@@ -208,6 +220,8 @@ class AgentState(TypedDict, total=False):
     citations: Annotated[list[Citation], replace]
     answer: str
     status: TurnStatus
+    # Spend against the per-turn tool budget. See `remaining_tool_budget`.
+    tool_calls_used: Annotated[int, add_counts]
 
     # -- thread-level diagnostics -----------------------------------------
     trace: Annotated[list[TraceEvent], accumulate_trace]
@@ -224,7 +238,18 @@ def new_turn_scratch() -> dict[str, Any]:
         "citations": [],
         "answer": "",
         "status": TurnStatus.PENDING,
+        "tool_calls_used": None,
     }
+
+
+def remaining_tool_budget(state: AgentState, limit: int) -> int:
+    """Tool calls still allowed this turn.
+
+    The budget is the circuit breaker on runaway orchestration: it caps the
+    blast radius of a bad plan, a retry storm, or a future replan loop, so one
+    turn can never spend unbounded money and latency.
+    """
+    return max(0, limit - int(state.get("tool_calls_used", 0)))
 
 
 def trace_for_turn(state: AgentState, turn_index: int | None = None) -> list[TraceEvent]:

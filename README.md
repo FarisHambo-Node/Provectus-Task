@@ -8,6 +8,25 @@ Everything AWS-facing is simulated so the system runs offline with no
 credentials. The swap points for Bedrock and OpenSearch are marked with `TODO`
 in the code.
 
+## Requirements map
+
+| Requirement | Where |
+| --- | --- |
+| Analyse the query to determine needed tools | `agent/nodes/analyze.py` → `plan_tools` |
+| Call a RAG tool to search internal docs | `agent/tools/rag_tool.py` over `agent/rag/` |
+| Optionally call a web search tool | `agent/tools/web_search_tool.py`, selected only when the query needs it |
+| Synthesise a final answer with citations | `agent/nodes/synthesize.py` → `build_citations`, `render_answer`, `verify_grounding` |
+| State management for multi-turn conversations | `agent/state.py` channels and reducers, `agent/memory.py` window and summary |
+| LangGraph orchestration | `agent/graph.py` |
+| Conditional edges for routing | `agent/routing.py`, four conditional edges |
+| Circuit breaker: max tool calls | `remaining_tool_budget` in `agent/state.py`, enforced in `route_after_analysis` and again in the tool nodes |
+| Circuit breaker: failing dependency | `CircuitBreaker` in `agent/tools/resilience.py` |
+| Checkpointing for conversation persistence | `agent/persistence.py`, SQLite backend, verified across process restarts |
+| Production-ready error handling | `agent/errors.py` taxonomy, `Tool.run` error boundary, `ResilientCheckpointSaver`, degraded and refusal paths |
+| Mocked RAG and web search | `agent/rag/retriever.py`, `SimulatedWebBackend` |
+
+126 tests, no network and no AWS: `pytest`.
+
 ## Requirements
 
 - Python 3.11 or newer (the checked-in `.venv` uses 3.14)
@@ -311,6 +330,15 @@ checkpoint, so `ConversationAgent` exposes:
 
 ## Error handling and monitoring
 
+There are two circuit breakers, and they trip on different things:
+
+| Breaker | Trips on | Effect |
+| --- | --- | --- |
+| tool-call budget (`MAX_TOOL_CALLS_PER_TURN`) | too many tool calls in one turn | caps the blast radius of a bad plan or a replan loop; the fan-out is clipped before the calls are made |
+| dependency breaker (`CircuitBreaker`) | consecutive failures from one tool | stops hammering a dead dependency, half-opens after a cooldown to probe |
+
+The rest of the error handling:
+
 - Every failure maps to a class in `agent/errors.py` carrying `retryable` and
   `recoverable`, so the retry policy never has to parse a message string.
 - `Tool.run` is the error boundary and **never raises**. A broken tool returns
@@ -338,6 +366,7 @@ Full list with defaults in `.env.example`. The ones worth knowing:
 | `TOOL_TIMEOUT_S` | `8.0` | per attempt, not per turn |
 | `TOOL_MAX_ATTEMPTS` | `3` | only `retryable` errors are retried |
 | `TOOL_MAX_CONCURRENCY` | `4` | caps blocking-call fan-out |
+| `MAX_TOOL_CALLS_PER_TURN` | `4` | the tool-call circuit breaker |
 | `ENABLE_WEB_SEARCH` | `true` | set to `false` to run internal-docs only |
 | `HISTORY_WINDOW_TURNS` | `6` | turns kept verbatim before older ones get summarised |
 | `SUMMARIZE_AFTER_TURNS` | `8` | must exceed the window, or every turn triggers a summary |

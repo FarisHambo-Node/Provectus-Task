@@ -10,6 +10,7 @@ import pytest
 from agent.container import build_container
 from agent.errors import RetrievalError, ThreadNotFoundError, ToolThrottledError
 from agent.graph import ConversationAgent
+from agent.nodes.tool_nodes import rag_search_node
 from agent.rag.corpus import SAMPLE_CORPUS
 from agent.rag.retriever import to_chunk
 from agent.settings import Settings
@@ -236,6 +237,69 @@ async def test_metrics_record_tool_outcomes():
 async def test_health_report_covers_every_registered_tool():
     agent = make_agent()
     assert set(await agent.container.health_report()) == {"rag_search", "web_search"}
+
+
+# --- tool-call budget (circuit breaker) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_every_call_including_failures():
+    agent = make_agent(
+        web_backend=StubWebBackend(error=ToolThrottledError("429", tool="web_search"))
+    )
+    result = await agent.ask("how do we chunk docs and what is the latest release?")
+    # Both tools ran; the failing one still spent its call.
+    assert result["tool_calls_used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_budget_of_one_allows_a_single_tool():
+    web = StubWebBackend()
+    agent = make_agent(web_backend=web, max_tool_calls_per_turn=1)
+    result = await agent.ask("how do we chunk docs and what is the latest release?")
+
+    assert result["tool_calls_used"] == 1
+    assert web.calls == []
+    assert result["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_budget_resets_between_turns():
+    agent = make_agent()
+    await agent.ask("how do we chunk docs and what is the latest release?", thread_id="t")
+    second = await agent.ask(
+        "how do we chunk docs and what is the latest release?", thread_id="t"
+    )
+    # Without the per-turn reset this would be 4.
+    assert second["tool_calls_used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_tool_node_refuses_to_run_once_the_budget_is_spent():
+    """The second line of defence, below the routing-level clip.
+
+    Unreachable through the current single-pass graph because `prepare_turn`
+    resets the counter and routing clips the fan-out. It exists so a replan
+    loop cannot bypass the breaker, so it is tested at the node directly.
+    """
+    retriever = StubRetriever()
+    container = build_container(
+        Settings(simulate_latency=False, log_level="CRITICAL", max_tool_calls_per_turn=2),
+        retriever=retriever,
+        web_backend=StubWebBackend(),
+    )
+    state = {
+        "query": "where is our chunking doc?",
+        "thread_id": "t",
+        "turn_index": 1,
+        "tool_calls_used": 2,
+    }
+
+    update = await rag_search_node(state, container)
+
+    assert retriever.calls == []
+    assert update["failures"][0]["code"] == "budget_exceeded"
+    assert "tool_calls_used" not in update
 
 
 # --- memory compaction -----------------------------------------------------

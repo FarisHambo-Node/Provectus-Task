@@ -14,10 +14,10 @@ from __future__ import annotations
 from typing import Any
 
 from agent.container import AgentContainer
-from agent.errors import ToolNotFoundError
+from agent.errors import BudgetExceededError, ToolNotFoundError
 from agent.nodes._common import node_span
 from agent.observability import SKIPPED_ATTR, TraceEvent
-from agent.state import AgentState, ToolName, ToolPlan
+from agent.state import AgentState, ToolName, ToolPlan, remaining_tool_budget
 from agent.tools.base import ToolRequest
 
 
@@ -39,6 +39,27 @@ async def _invoke_tool(
 ) -> dict[str, Any]:
     trace: list[TraceEvent] = []
     async with node_span(str(tool_name), state, container, trace) as attrs:
+        budget = remaining_tool_budget(state, container.settings.max_tool_calls_per_turn)
+        attrs["budget_remaining"] = budget
+        if budget <= 0:
+            # Routing already clips the fan-out; this is the second line of
+            # defence so no path can reach a tool with the breaker tripped.
+            error = BudgetExceededError(
+                "tool-call budget exhausted for this turn",
+                context={
+                    "tool": str(tool_name),
+                    "limit": container.settings.max_tool_calls_per_turn,
+                },
+            )
+            attrs[SKIPPED_ATTR] = True
+            container.metrics.increment("budget.exceeded", 1.0, tool=str(tool_name))
+            container.logger.warning(
+                "tool.budget_exceeded",
+                tool=str(tool_name),
+                limit=container.settings.max_tool_calls_per_turn,
+            )
+            return {"failures": [error.to_dict()], "trace": trace}
+
         try:
             tool = container.registry.get(tool_name)
         except ToolNotFoundError as exc:
@@ -54,6 +75,9 @@ async def _invoke_tool(
 
         update: dict[str, Any] = {
             "invocations": [result.to_invocation()],
+            # One call spent, success or not: a failing tool still costs time
+            # and money, so it has to count against the breaker.
+            "tool_calls_used": 1,
             "trace": trace,
         }
         if result.ok:

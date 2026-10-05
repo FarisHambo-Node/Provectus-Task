@@ -102,8 +102,11 @@ def build_graph(
     builder.add_edge(NODE_SUMMARIZE, NODE_ANALYZE)
     builder.add_conditional_edges(
         NODE_ANALYZE,
-        route_after_analysis,
-        [NODE_RAG, NODE_WEB, NODE_CLARIFY],
+        partial(
+            route_after_analysis,
+            max_tool_calls_per_turn=container.settings.max_tool_calls_per_turn,
+        ),
+        [NODE_RAG, NODE_WEB, NODE_CLARIFY, NODE_FAILURE],
     )
     # Tool branches converge on the join node; gather runs once, after both.
     builder.add_edge(NODE_RAG, NODE_GATHER)
@@ -290,6 +293,7 @@ class ConversationAgent:
             "answer": final.get("answer", ""),
             "citations": [c.model_dump() for c in final.get("citations", [])],
             "tools_used": [inv.tool for inv in final.get("invocations", []) if inv.ok],
+            "tool_calls_used": final.get("tool_calls_used", 0),
             "failures": final.get("failures", []),
             "summary": final.get("summary", ""),
             "stored_turns": count_turns(final.get("messages", [])),

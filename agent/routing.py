@@ -11,7 +11,7 @@ name in the list runs in the same superstep.
 from __future__ import annotations
 
 from agent.memory import should_summarize
-from agent.state import AgentState, ToolName, TurnStatus
+from agent.state import AgentState, ToolName, TurnStatus, remaining_tool_budget
 
 NODE_PREPARE = "prepare_turn"
 NODE_SUMMARIZE = "summarize_history"
@@ -26,8 +26,9 @@ TOOL_NODES: dict[ToolName, str] = {
     ToolName.WEB_SEARCH: "web_search",
 }
 
-# Matches the Settings default; the graph binds the configured value.
+# Match the Settings defaults; the graph binds the configured values.
 DEFAULT_SUMMARIZE_AFTER_TURNS = 8
+DEFAULT_MAX_TOOL_CALLS = 4
 
 
 def route_after_prepare(
@@ -49,11 +50,19 @@ def route_after_prepare(
     return NODE_ANALYZE
 
 
-def route_after_analysis(state: AgentState) -> list[str]:
+def route_after_analysis(
+    state: AgentState,
+    *,
+    max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS,
+) -> list[str]:
     """Fan out to the planned tools, or divert to clarification.
 
     Returning several node names runs them concurrently. They all converge on
-    `gather`, which LangGraph executes once both branches have finished.
+    `gather`, which LangGraph executes once every branch has finished.
+
+    This is also where the tool-call budget is enforced: the fan-out is clipped
+    to whatever the turn can still afford, so the breaker trips before the
+    calls are made rather than after.
     """
     if state.get("status") == TurnStatus.NEEDS_CLARIFICATION:
         return [NODE_CLARIFY]
@@ -63,7 +72,15 @@ def route_after_analysis(state: AgentState) -> list[str]:
         return [NODE_CLARIFY]
 
     targets = [TOOL_NODES[tool] for tool in plan.tools if tool in TOOL_NODES]
-    return targets or [NODE_CLARIFY]
+    if not targets:
+        return [NODE_CLARIFY]
+
+    budget = remaining_tool_budget(state, max_tool_calls_per_turn)
+    if budget <= 0:
+        # Only reachable once a replan loop re-enters this edge with the
+        # budget already spent. Refuse rather than answer ungrounded.
+        return [NODE_FAILURE]
+    return targets[:budget]
 
 
 def route_after_gather(state: AgentState) -> str:

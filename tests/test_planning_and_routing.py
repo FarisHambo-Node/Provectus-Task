@@ -15,7 +15,14 @@ from agent.routing import (
     route_after_prepare,
 )
 from agent.settings import Settings
-from agent.state import RetrievedChunk, ToolName, ToolPlan, TurnStatus
+from agent.state import (
+    RetrievedChunk,
+    ToolName,
+    ToolPlan,
+    TurnStatus,
+    add_counts,
+    remaining_tool_budget,
+)
 from agent.tools.rag_tool import RAG_TOOL_SPEC
 from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC
 
@@ -131,3 +138,41 @@ def test_gather_routes_to_failure_without_evidence():
     assert route_after_gather({"status": TurnStatus.FAILED}) == NODE_FAILURE
     # Status says ok but nothing was retrieved: never let that reach synthesis.
     assert route_after_gather({"status": TurnStatus.OK}) == NODE_FAILURE
+
+
+# --- tool-call budget (circuit breaker) ------------------------------------
+
+
+def test_fan_out_is_clipped_to_the_remaining_budget():
+    state = {
+        "plan": ToolPlan(tools=[ToolName.RAG_SEARCH, ToolName.WEB_SEARCH]),
+        "tool_calls_used": 1,
+    }
+    assert route_after_analysis(state, max_tool_calls_per_turn=2) == ["rag_search"]
+
+
+def test_exhausted_budget_trips_to_the_failure_path():
+    state = {
+        "plan": ToolPlan(tools=[ToolName.RAG_SEARCH]),
+        "tool_calls_used": 3,
+    }
+    assert route_after_analysis(state, max_tool_calls_per_turn=3) == [NODE_FAILURE]
+
+
+def test_full_budget_allows_the_whole_plan():
+    state = {"plan": ToolPlan(tools=[ToolName.RAG_SEARCH, ToolName.WEB_SEARCH])}
+    assert route_after_analysis(state, max_tool_calls_per_turn=4) == [
+        "rag_search",
+        "web_search",
+    ]
+
+
+def test_remaining_budget_never_goes_negative():
+    assert remaining_tool_budget({"tool_calls_used": 9}, 4) == 0
+    assert remaining_tool_budget({}, 4) == 4
+
+
+def test_budget_counter_sums_across_parallel_branches():
+    # Each tool node reports one call; the reducer has to add, not overwrite.
+    assert add_counts(add_counts(0, 1), 1) == 2
+    assert add_counts(5, None) == 0
