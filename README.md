@@ -362,7 +362,10 @@ failing:
 3. `agent/nodes/synthesize.py` — replace `render_answer` with Converse
    generation, keeping the citation contract and the grounding post-check.
 
-Before running behind more than one process, replace `InMemorySaver` in
-`agent/graph.py` with a durable checkpointer (DynamoDB or Postgres). In-memory
-state dies with the Lambda container and breaks multi-turn for the next
-request.
+For checkpointing, SQLite is durable but single-writer, so it does not survive
+horizontal scaling. Add a third branch to `checkpointer_scope` in
+`agent/persistence.py` using `langgraph-checkpoint-postgres`
+(`AsyncPostgresSaver`) against Aurora Serverless v2, or a DynamoDB saver if you
+want per-thread partitioning and TTL-based expiry. `ResilientCheckpointSaver`
+wraps whatever you pick, so the retry and degradation behaviour comes along
+unchanged.
